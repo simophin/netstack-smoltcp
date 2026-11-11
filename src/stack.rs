@@ -30,6 +30,7 @@ pub struct StackBuilder {
     // high-BDP hosts can raise it without recompiling.
     tcp_recv_buffer_size: u32,
     tcp_send_buffer_size: u32,
+    tcp_keep_alive: Option<std::time::Duration>,
     mtu: usize,
     ip_filters: IpFilters<'static>,
 }
@@ -51,6 +52,7 @@ impl Default for StackBuilder {
             // `tcp_{recv,send}_buffer_size` for a high-BDP path.
             tcp_recv_buffer_size: 0x3FFF * 20,
             tcp_send_buffer_size: 0x3FFF * 20,
+            tcp_keep_alive: Some(std::time::Duration::from_secs(28)),
             mtu: 1504, // 1500 for Ethernet + 4 for VLAN
             ip_filters: IpFilters::with_non_broadcast(),
         }
@@ -103,6 +105,13 @@ impl StackBuilder {
     /// `SocketBuffer` capacity). See [`Self::tcp_recv_buffer_size`].
     pub fn tcp_send_buffer_size(mut self, size: u32) -> Self {
         self.tcp_send_buffer_size = size;
+        self
+    }
+
+    /// Set the TCP keep-alive interval of every socket, or None to send no
+    /// keep-alives. Defaults to 28 seconds.
+    pub fn tcp_keep_alive(mut self, interval: Option<std::time::Duration>) -> Self {
+        self.tcp_keep_alive = interval;
         self
     }
 
@@ -175,6 +184,7 @@ impl StackBuilder {
                 self.mtu,
                 self.tcp_recv_buffer_size,
                 self.tcp_send_buffer_size,
+                self.tcp_keep_alive,
             )?;
             (Some(tcp_runner), Some(tcp_listener))
         } else {

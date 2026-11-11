@@ -73,12 +73,13 @@ impl TcpListenerRunner {
         sockets: HashMap<SocketHandle, SharedControl>,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        tcp_keep_alive: Option<std::time::Duration>,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, tcp_recv_buffer_size, tcp_send_buffer_size) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, tcp_recv_buffer_size, tcp_send_buffer_size, tcp_keep_alive) => v,
                 v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
             };
             res?;
@@ -97,6 +98,7 @@ impl TcpListenerRunner {
         socket_tx: UnboundedSender<TcpSocketCreation>,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        tcp_keep_alive: Option<std::time::Duration>,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             let packet = match IpPacket::new_checked(frame.as_slice()) {
@@ -140,7 +142,7 @@ impl TcpListenerRunner {
                     TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
                     TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
                 );
-                socket.set_keep_alive(Some(Duration::from_secs(28)));
+                socket.set_keep_alive(tcp_keep_alive.map(Duration::from));
                 // FIXME: It should follow system's setting. 7200 is Linux's default.
                 socket.set_timeout(Some(Duration::from_secs(7200)));
                 // NO ACK delay
@@ -351,20 +353,24 @@ impl TcpListenerRunner {
             // cooperative `yield_now()` keeps the re-poll just as prompt while
             // letting `handle_packet` make progress. The timed-park path and the
             // 5 ms idle fallback are unchanged, so there is no missed-wake risk.
+            //
+            // With no timer due, wait for the next packet or stream activity, all of
+            // which notify. A notification that arrives before the wait starts is kept
+            // by `Notify`, so none is missed, and an idle stack never wakes up: polling
+            // every few milliseconds would keep a phone's CPU out of deep sleep.
             if iface_ingress_tx_avail.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             } else {
-                let next_duration = iface
-                    .poll_delay(before_poll, &socket_set)
-                    .unwrap_or(Duration::from_millis(5));
-                if next_duration != Duration::ZERO {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from(next_duration),
-                        notify.notified(),
-                    )
-                    .await;
-                } else {
-                    tokio::task::yield_now().await;
+                match iface.poll_delay(before_poll, &socket_set) {
+                    Some(Duration::ZERO) => tokio::task::yield_now().await,
+                    Some(next_duration) => {
+                        let _ = tokio::time::timeout(
+                            tokio::time::Duration::from(next_duration),
+                            notify.notified(),
+                        )
+                        .await;
+                    }
+                    None => notify.notified().await,
                 }
             }
         }
@@ -382,6 +388,7 @@ impl TcpListener {
         mtu: usize,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        tcp_keep_alive: Option<std::time::Duration>,
     ) -> std::io::Result<(Runner, Self)> {
         let (mut device, iface_ingress_tx, iface_ingress_tx_avail) =
             VirtualDevice::new(stack_tx, mtu);
@@ -399,6 +406,7 @@ impl TcpListener {
             HashMap::new(),
             tcp_recv_buffer_size,
             tcp_send_buffer_size,
+            tcp_keep_alive,
         );
 
         Ok((runner, Self { stream_rx }))
